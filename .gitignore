@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.tsbuildinfo
 .local-tools/
+/server/src/generated/prisma/
 .env
 .env.*
 !.env.example
