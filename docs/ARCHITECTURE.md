@@ -53,8 +53,8 @@ When React sends `POST /api/me/bookmarks`, the service takes the user ID from th
 | `POST` | `/api/auth/logout` | Session | Revoke the current session and clear the cookie. |
 | `GET` | `/api/auth/me` | Session | Read the current user’s identity and role. |
 | `GET` | `/api/me/bookmarks` | Signed-in `USER` or `ADMIN` | List the session user’s bookmarks. |
-| `POST` | `/api/me/bookmarks` | Signed-in `USER` or `ADMIN` | Save the contest identified by `contestId`. |
-| `DELETE` | `/api/me/bookmarks/:contestId` | Signed-in `USER` or `ADMIN` | Remove the session user’s bookmark. |
+| `POST` | `/api/me/bookmarks` | Signed-in `USER` or `ADMIN` | Save a published contest. Both the initial save and repeats return `204`. |
+| `DELETE` | `/api/me/bookmarks/:contestId` | Signed-in `USER` or `ADMIN` | Remove the session user’s bookmark. Return `204` even if the row is already absent. |
 | `GET` | `/api/admin/contests` | `ADMIN` | List curated contests, including unpublished records. |
 | `POST` | `/api/admin/contests` | `ADMIN` | Create a curated contest. |
 | `PATCH` | `/api/admin/contests/:id` | `ADMIN` | Edit, publish, or unpublish a curated contest. |
@@ -74,7 +74,6 @@ Return `400` for invalid input, `401` when a protected request lacks a valid ses
 
 ## Decisions for later stages
 
-- **Stage 7.** Decide whether saving an existing bookmark returns idempotent success or `409 Conflict`. Either contract must preserve one row per user and contest.
 - **Stage 12.** Select deployment providers and confirm support for the same-origin `/api` proxy. A separate API origin requires explicit cookie, CORS, and CSRF configuration.
 
 See the [product requirements](PRD.md) and [build guide](ContestHub_Build_Guide.md).

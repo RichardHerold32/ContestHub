@@ -8,6 +8,11 @@
     "prebuild": "npm run db:generate",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "pretest": "npm run db:generate",
+    "test": "vitest run",
+    "presync": "npm run build",
+    "sync": "node dist/scripts/sync-codeforces.js",
+    "seed:admin": "node dist/scripts/seed-admin.js",
     "db:generate": "prisma generate",
     "predb:check": "npm run build",
     "db:check": "node dist/scripts/check-db.js"
@@ -20,17 +25,25 @@
   "dependencies": {
     "@prisma/adapter-pg": "7.10.1",
     "@prisma/client": "7.10.1",
+    "argon2": "^0.45.2",
+    "cookie-parser": "^1.4.7",
     "dotenv": "18.0.10",
     "express": "^5.3.0",
+    "express-rate-limit": "^8.7.5",
     "helmet": "^8.3.0",
-    "pg": "8.23.1"
+    "pg": "8.23.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
     "@types/express": "^5.0.6",
     "@types/node": "^24.19.2",
     "@types/pg": "8.23.1",
+    "@types/supertest": "^7.2.1",
     "prisma": "7.10.1",
+    "supertest": "^7.3.2",
     "tsx": "^4.23.15",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.12"
   }
 }
