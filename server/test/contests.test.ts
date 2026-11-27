@@ -98,6 +98,18 @@ describe("with seeded contests", () => {
     expect(body.pagination.total).toBe(1);
   });
 
+  it("preserves the combined filter total and tie-break order across pages", async () => {
+    const filters = { search: "round", category: "CODING", source: "CODEFORCES", upcoming: "true", limit: 1 };
+    const expectedPages = [["a"], ["b"], []];
+
+    for (const [index, expectedIds] of expectedPages.entries()) {
+      const page = index + 1;
+      const { body } = await api.get("/api/contests").query({ ...filters, page }).expect(200);
+      expect(body.items.map(({ id }: { id: string }) => id)).toEqual(expectedIds);
+      expect(body.pagination).toEqual({ page, limit: 1, total: 2, totalPages: 2 });
+    }
+  });
+
   it.each([
     ["search=round", ["a", "b", "d", "e"]],
     ["search=%20100%25_%5C%20", ["a"]],
@@ -130,4 +142,21 @@ describe("with seeded contests", () => {
     ]);
     expect(body.items[4].endsAt).toBe(now.toISOString());
   });
+});
+
+it("treats SQL-like search text as literal data and still excludes unpublished matches", async () => {
+  const text = "' OR '1'='1' --";
+  const startsAt = new Date("2026-12-02T12:00:00.000Z");
+  const sharedFields = { source: "MANUAL", startsAt, sourceUrl: "https://example.invalid/contest" } as const;
+  await database().contest.createMany({
+    data: [
+      { ...sharedFields, externalId: "literal-public", title: "SQL notation " + text },
+      { ...sharedFields, externalId: "literal-hidden", title: "Hidden SQL notation " + text, isPublished: false },
+      { ...sharedFields, externalId: "unrelated", title: "Unrelated contest" },
+    ],
+  });
+
+  const { body } = await api.get("/api/contests").query({ search: text }).expect(200);
+  expect(body.items).toEqual([expect.objectContaining({ title: "SQL notation " + text })]);
+  expect(body.pagination.total).toBe(1);
 });

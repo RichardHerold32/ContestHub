@@ -1,9 +1,37 @@
+import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
+import { app } from "../src/app.js";
+import type { PrismaClient } from "../src/generated/prisma/client.js";
+import { runCodeforcesJob } from "../src/services/codeforces-job.js";
 import { fetchContestList, syncCodeforces } from "../src/services/codeforces.js";
 import { useTestDatabase } from "./database.js";
 
 function feed(...rows: unknown[]) {
   return vi.fn<typeof fetch>(async () => Response.json({ status: "OK", result: rows }));
+}
+
+function runJob(prisma: PrismaClient, fetcher: typeof fetch) {
+  const lines: string[] = [];
+  const done = runCodeforcesJob({
+    openDatabase: async () => prisma,
+    closeDatabase: async () => { /* the test fixture owns this connection */ },
+    fetcher,
+    writeLine: (line) => lines.push(line),
+  });
+  return { lines, done };
+}
+
+function jobResult(lines: string[]) {
+  expect(lines).toHaveLength(2);
+  const [start, end] = lines.map((line) => JSON.parse(line));
+  expect(start).toMatchObject({ event: "codeforces.sync.start", runId: expect.any(String) });
+  expect(end).toMatchObject({
+    event: "codeforces.sync.end", runId: start.runId, durationMs: expect.any(Number),
+  });
+  expect(end.durationMs).toBeGreaterThanOrEqual(0);
+  expect(start.timestamp).toBe(new Date(start.timestamp).toISOString());
+  expect(end.timestamp).toBe(new Date(end.timestamp).toISOString());
+  return end;
 }
 
 describe("Codeforces response handling", () => {
@@ -114,4 +142,87 @@ describe("Codeforces ingestion into PostgreSQL", () => {
     expect(performance.now() - startedAt).toBeGreaterThanOrEqual(1_990);
     expect(fetcher).toHaveBeenCalledTimes(1);
   }, 8_000);
+
+  it("logs an overlapping trigger as skipped and reports committed counts on replay", async () => {
+    const prisma = db();
+    const row = { ...contest, id: 181, name: "Scheduled round" };
+    const entered = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<Response>();
+    const sharedFetcher = feed(row).mockImplementationOnce(() => {
+      entered.resolve();
+      return response.promise;
+    });
+    const first = runJob(prisma, sharedFetcher);
+    await entered.promise;
+    const second = runJob(prisma, sharedFetcher);
+    const secondExit = await second.done;
+    response.resolve(Response.json({ status: "OK", result: [row, row] }));
+
+    expect(secondExit).toBe(0);
+    expect(jobResult(second.lines)).toMatchObject({
+      status: "skipped", errorCode: "OVERLAPPING_RUN", fetched: null, created: 0, updated: 0, skipped: null,
+    });
+    expect(await first.done).toBe(0);
+    const firstEnd = jobResult(first.lines);
+    expect(firstEnd).toMatchObject({ status: "success", fetched: 2, created: 1, updated: 0, skipped: 1 });
+    expect(firstEnd.runId).not.toBe(jobResult(second.lines).runId);
+    expect(sharedFetcher).toHaveBeenCalledTimes(1);
+
+    const replay = runJob(prisma, feed(row));
+    expect(await replay.done).toBe(0);
+    expect(jobResult(replay.lines)).toMatchObject({ status: "success", fetched: 1, created: 0, updated: 0, skipped: 1 });
+    expect(await prisma.contest.count({ where: { source: "CODEFORCES", externalId: "181" } })).toBe(1);
+  }, 15_000);
+
+  it("logs the upstream timeout while the public API continues to serve stored contests", async () => {
+    const prisma = db();
+    const saved = await prisma.contest.create({
+      data: {
+        source: "CODEFORCES", externalId: "182", title: "Last good sync round",
+        startsAt: new Date(contest.startTimeSeconds * 1000), sourceUrl: "https://codeforces.com/contest/182",
+      },
+    });
+    const entered = Promise.withResolvers<void>();
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) => {
+      entered.resolve();
+      const signal = init!.signal!;
+      return new Promise<Response>((_, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("Private upstream details")), { once: true });
+      });
+    });
+    const job = runJob(prisma, fetcher);
+    const readCatalogue = async () => {
+      const { body } = await request(app).get("/api/contests").query({ search: saved.title }).expect(200);
+      expect(body.items).toEqual([expect.objectContaining({ id: saved.id, title: saved.title })]);
+    };
+    await entered.promise;
+    await readCatalogue();
+    expect(await job.done).toBe(1);
+    expect(jobResult(job.lines)).toMatchObject({
+      status: "failed", errorCode: "UPSTREAM_TIMEOUT", fetched: null, created: 0, updated: 0, skipped: null,
+    });
+    expect(job.lines.join("\n")).not.toContain("Private upstream details");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await readCatalogue();
+  }, 20_000);
+
+  it("reports fetched rows and zero committed writes when the import rolls back", async () => {
+    const prisma = db();
+    await prisma.$executeRaw`ALTER TABLE "Contest" ADD CONSTRAINT "reject_sync_fixture"
+      CHECK ("title" <> 'Rejected sync fixture')`;
+    try {
+      const job = runJob(prisma, feed(
+        { ...contest, id: 183, name: "Valid sync fixture" },
+        { ...contest, id: 184, name: "Rejected sync fixture" },
+      ));
+      expect(await job.done).toBe(1);
+      expect(jobResult(job.lines)).toMatchObject({
+        status: "failed", errorCode: "DATABASE_ERROR", fetched: 2, created: 0, updated: 0, skipped: null,
+      });
+      expect(job.lines.join("\n")).not.toContain("reject_sync_fixture");
+      expect(await prisma.contest.count({ where: { externalId: { in: ["183", "184"] } } })).toBe(0);
+    } finally {
+      await prisma.$executeRaw`ALTER TABLE "Contest" DROP CONSTRAINT "reject_sync_fixture"`;
+    }
+  }, 12_000);
 });

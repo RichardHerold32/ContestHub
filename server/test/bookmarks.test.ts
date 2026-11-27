@@ -110,3 +110,29 @@ it("rejects signed-out and revoked sessions", async () => {
   await remove(former.cookie, id).expect(401);
   expect(await db().bookmark.count({ where: { contestId: id, userId: former.id } })).toBe(1);
 });
+
+it("orders bookmarks by newest save and then by contest ID for ties", async () => {
+  const owner = await account();
+  const latest = new Date("2026-11-27T12:00:00.000Z");
+  const older = new Date("2026-11-26T12:00:00.000Z");
+  const saves = [
+    { contestId: "bookmark-older", createdAt: older },
+    { contestId: "bookmark-b", createdAt: latest },
+    { contestId: "bookmark-a", createdAt: latest },
+  ];
+  await db().contest.createMany({
+    data: saves.map(({ contestId }) => ({
+      id: contestId, externalId: contestId, source: "MANUAL", title: contestId,
+      startsAt: older, sourceUrl: "https://example.invalid/contest",
+    })),
+  });
+  await db().bookmark.createMany({ data: saves.map((save) => ({ ...save, userId: owner.id })) });
+
+  const { body } = await list(owner.cookie).expect(200);
+  expect(body.items).toMatchObject([
+    { savedAt: latest.toISOString(), contest: { id: "bookmark-a" } },
+    { savedAt: latest.toISOString(), contest: { id: "bookmark-b" } },
+    { savedAt: older.toISOString(), contest: { id: "bookmark-older" } },
+  ]);
+  expect(body.items).toHaveLength(3);
+});

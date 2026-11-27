@@ -232,7 +232,7 @@ npm.cmd --prefix server run sync
 npm.cmd --prefix server test -- codeforces
 ~~~
 
-The first successful sync prints `added=N updated=N skipped=N`. With an unchanged feed, the second run should report zero added and zero updated. Skips include past contests, missing or invalid fields, repeated source IDs and already-current rows. A valid empty feed produces three zeroes. With Express running, inspect the published upcoming rows using the existing endpoint.
+The successful sync prints a JSON end event with `fetched`, `created`, `updated`, and `skipped` counts. With an unchanged feed, the second run should report zero created and zero updated. Skips include past contests, missing or invalid fields, repeated source IDs and already-current rows. A valid empty feed produces four zeroes. With Express running, inspect the published upcoming rows using the existing endpoint.
 
 ~~~powershell
 curl.exe -sS "http://127.0.0.1:4000/api/contests?source=CODEFORCES&upcoming=true"
@@ -374,3 +374,52 @@ npm.cmd --prefix server run build
 ~~~
 
 **Interview question.** A regular user opens DevTools and sends a direct `PATCH` request to publish a contest. Which backend checks run, and where does the server get the user's role?
+
+## Stage 9 · Contest SQL and performance
+
+Run the opt-in query-plan lab against a disposable PostgreSQL database and compare shallow pagination, a selective category range, title substring search, and the authenticated bookmark join. The walkthrough includes the equivalent SQL, commands, measured plans, and a guide to reading them. [Stage 9 query-plan walkthrough](docs/QUERY_PLANS.md)
+
+## Stage 10 · Schedule the Codeforces sync
+
+Windows Task Scheduler launches the same compiled job as `npm run sync`. The local task runs under the current signed-in Windows account with limited privileges. Keep PostgreSQL reachable and `DATABASE_URL` configured in the ignored `server/.env`. The launcher uses the server directory as its working directory and an absolute Node path.
+
+From the repository root, build the server and preview the task definition.
+
+~~~powershell
+$nodePath = (Get-Command node.exe -CommandType Application).Source
+npm.cmd --prefix server run build
+if ($LASTEXITCODE -ne 0) { throw 'Build the server before registering the task.' }
+.\server\scripts\Register-CodeforcesSyncTask.ps1 -NodePath $nodePath -DefinitionOnly
+~~~
+
+If PowerShell blocks local scripts and your organization permits them, run `Set-ExecutionPolicy -Scope Process RemoteSigned` in the current terminal. The task also uses `RemoteSigned` for its own PowerShell process. Group Policy still takes precedence. [PowerShell execution policies](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies)
+
+For a portable Node installation, set `$nodePath` to its absolute `node.exe` path. Register the task when you want recurring runs. The first trigger is about a minute after registration, then every six hours. The installer reports an error if the task name already exists.
+
+~~~powershell
+.\server\scripts\Register-CodeforcesSyncTask.ps1 -NodePath $nodePath
+Start-ScheduledTask -TaskName ContestHub-CodeforcesSync
+Get-ScheduledTaskInfo -TaskName ContestHub-CodeforcesSync
+Get-Content .\server\logs\codeforces-sync.jsonl -Encoding UTF8 -Tail 20
+~~~
+
+Check the log after the task has finished. Task Scheduler ignores a trigger while an instance of the task is active. The database lock also protects against a simultaneous manual run. Run once independently of Task Scheduler with the launcher, or remove the recurring task with the following command.
+
+~~~powershell
+.\server\scripts\Invoke-CodeforcesSync.ps1 -NodePath $nodePath
+Unregister-ScheduledTask -TaskName ContestHub-CodeforcesSync
+~~~
+
+Each job writes `codeforces.sync.start` and `codeforces.sync.end` with the same run ID and UTC timestamps. The end event reports elapsed milliseconds and the outcome. `fetched` counts rows in a validated feed. `created` and `updated` count committed writes. `skipped` counts feed rows that needed no write, including invalid entries, duplicate IDs, and unchanged rows. Counts unavailable for an unfinished import are `null`. A launcher failure before the job can report its result produces a `codeforces.launcher.error` event.
+
+| Outcome | Exit code | What happens |
+|---|---:|---|
+| Success | 0 | A valid feed was processed. Replaying it adds zero duplicate rows. |
+| Overlap | 0 | The end event reports `OVERLAPPING_RUN`. The active run keeps the lock and the second trigger makes no upstream request. |
+| Failure | 1 | The end event includes a controlled error code such as `UPSTREAM_TIMEOUT`, or `UPSTREAM_HTTP_ERROR` with the HTTP status. An incomplete import rolls back. |
+
+In-process cron starts with Express and runs in each replica. The external task has its own lifecycle and requires setup on the machine that runs it. Each job makes one request with a 10-second deadline and holds the database lock for at least two seconds from the start of that request. The next trigger is the retry policy, which avoids a burst of requests during an outage. The public API reads PostgreSQL throughout. An upstream edit becomes visible after the next successful sync, so the catalogue is eventually consistent. [Codeforces API usage limits](https://codeforces.com/apiHelp)
+
+Run `npm.cmd --prefix server test -- codeforces` to exercise the timeout, overlapping triggers, replay, and transaction rollback with mocked upstream responses and disposable PostgreSQL data.
+
+**Interview question.** If a scheduler fires twice and Codeforces times out on the active run, which parts of the system keep the catalogue available and the import from overlapping?

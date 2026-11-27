@@ -16,8 +16,14 @@ const upcomingContest = z.object({
   durationSeconds: z.int().positive(),
 });
 
-// Only these controlled messages may reach CLI logs.
-export class SyncError extends Error {}
+type SyncErrorCode = "OVERLAPPING_RUN" | "UPSTREAM_TIMEOUT" | "UPSTREAM_HTTP_ERROR"
+  | "UPSTREAM_INVALID_JSON" | "UPSTREAM_INVALID_RESPONSE" | "UPSTREAM_FAILED" | "UPSTREAM_NETWORK_ERROR";
+
+export class SyncError extends Error {
+  constructor(readonly code: SyncErrorCode, message: string, readonly httpStatus?: number) {
+    super(message);
+  }
+}
 
 export async function fetchContestList(fetcher: typeof fetch = fetch) {
   const controller = new AbortController();
@@ -26,17 +32,17 @@ export async function fetchContestList(fetcher: typeof fetch = fetch) {
     const response = await fetcher(endpoint, { signal: controller.signal, redirect: "manual" });
     if (!response.ok) {
       controller.abort();
-      throw new SyncError(`Codeforces returned HTTP ${response.status}.`);
+      throw new SyncError("UPSTREAM_HTTP_ERROR", `Codeforces returned HTTP ${response.status}.`, response.status);
     }
     const parsed = envelope.safeParse(await response.json());
-    if (!parsed.success) throw new SyncError("Invalid Codeforces response shape.");
-    if (parsed.data.status === "FAILED") throw new SyncError("Codeforces reported FAILED.");
+    if (!parsed.success) throw new SyncError("UPSTREAM_INVALID_RESPONSE", "Invalid Codeforces response shape.");
+    if (parsed.data.status === "FAILED") throw new SyncError("UPSTREAM_FAILED", "Codeforces reported FAILED.");
     return parsed.data.result;
   } catch (error) {
     if (error instanceof SyncError) throw error;
-    if (controller.signal.aborted) throw new SyncError("Codeforces timed out after 10 seconds.");
-    if (error instanceof SyntaxError) throw new SyncError("Invalid JSON from Codeforces.");
-    throw new SyncError("Could not read the Codeforces response.");
+    if (controller.signal.aborted) throw new SyncError("UPSTREAM_TIMEOUT", "Codeforces timed out after 10 seconds.");
+    if (error instanceof SyntaxError) throw new SyncError("UPSTREAM_INVALID_JSON", "Invalid JSON from Codeforces.");
+    throw new SyncError("UPSTREAM_NETWORK_ERROR", "Could not read the Codeforces response.");
   } finally {
     clearTimeout(timer);
   }
@@ -53,18 +59,19 @@ function normalise(row: unknown, now: number) {
   return { externalId: String(id), title: name, startsAt, endsAt, sourceUrl: `https://codeforces.com/contest/${id}` };
 }
 
-export async function syncCodeforces(db: PrismaClient, fetcher: typeof fetch = fetch) {
+export async function syncCodeforces(db: PrismaClient, fetcher: typeof fetch = fetch, onFetched?: (count: number) => void) {
   return db.$transaction(async (tx) => {
     // The two integer keys identify this job within the database. Commit or rollback releases the lock.
     const [lock] = await tx.$queryRaw<{ acquired: boolean }[]>`
       SELECT pg_try_advisory_xact_lock(1128813890, 1) AS acquired
     `;
-    if (!lock.acquired) throw new SyncError("A Codeforces sync is already running.");
+    if (!lock.acquired) throw new SyncError("OVERLAPPING_RUN", "A Codeforces sync is already running.");
 
     const requestedAt = performance.now();
     let rows: unknown[];
     try {
       rows = await fetchContestList(fetcher);
+      onFetched?.(rows.length);
     } finally {
       const remaining = Math.ceil(requestIntervalMs - (performance.now() - requestedAt));
       if (remaining > 0) await delay(remaining);
